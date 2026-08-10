@@ -73,6 +73,40 @@ button:active { transform: translateY(1px); }
 .action-button.primary:hover { background: var(--accent-dark); color: #fff; }
 .action-button.selected { background: var(--warm); border-color: #d8c98f; }
 .action-button.subtle { color: var(--muted); }
+button:disabled {
+  cursor: not-allowed;
+  opacity: .52;
+}
+.auth-panel {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.auth-input {
+  width: 138px;
+  min-height: 36px;
+  padding: 7px 9px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  color: var(--ink);
+  outline: none;
+}
+.auth-input:focus { border-color: #b6cab2; box-shadow: 0 0 0 3px rgba(79, 112, 89, .12); }
+.auth-badge {
+  display: inline-flex;
+  align-items: center;
+  min-height: 36px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--muted);
+  background: var(--surface);
+  font-size: 13px;
+}
+.auth-badge.editor { color: #2f5d3e; background: #e7f3e7; border-color: #bad5be; }
+.auth-badge.readonly { color: #765b2d; background: #fbf0d2; border-color: #ead49a; }
 .button-icon { display: inline-block; margin-right: 4px; font-weight: 700; }
 .icon-button { display: inline-grid; place-items: center; width: 38px; padding: 0; flex: 0 0 auto; }
 .icon-button.small { width: 32px; min-height: 32px; }
@@ -195,6 +229,17 @@ button:active { transform: translateY(1px); }
   color: var(--muted);
   font-size: 13px;
 }
+.cloud-status {
+  margin: -6px 0 14px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--muted);
+  background: rgba(255, 253, 247, .72);
+  font-size: 13px;
+}
+.cloud-status.editable { color: #2f5d3e; background: #eaf5ea; border-color: #bfd8c2; }
+.cloud-status.readonly { color: #765b2d; background: #fbf1d9; border-color: #ead7a7; }
 .search-box {
   display: flex;
   align-items: center;
@@ -378,6 +423,9 @@ button:active { transform: translateY(1px); }
 }
 @media (max-width: 640px) {
   .top-actions button { flex: 1 1 auto; }
+  .auth-panel { width: 100%; }
+  .auth-input { flex: 1 1 150px; }
+  .auth-badge { flex: 1 1 100%; }
   .content-toolbar, .chapter-heading, .section-heading, .item-header { display: grid; }
   .search-box { width: 100%; }
   .chapter-tools, .section-tools, .item-actions { justify-content: flex-start; }

@@ -3,6 +3,12 @@ import path from "node:path";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
+function githubPagesBase() {
+  const repoName = process.env.GITHUB_REPOSITORY?.split("/")[1];
+  if (!process.env.GITHUB_ACTIONS || !repoName || repoName.endsWith(".github.io")) return "/";
+  return `/${repoName}/`;
+}
+
 function permanentSavePlugin() {
   return {
     name: "art-recite-permanent-save",
@@ -46,5 +52,6 @@ function permanentSavePlugin() {
 }
 
 export default defineConfig({
+  base: githubPagesBase(),
   plugins: [react(), permanentSavePlugin()],
 });

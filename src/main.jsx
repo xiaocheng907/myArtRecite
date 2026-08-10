@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { isSupabaseConfigured, supabase } from "./supabaseClient";
 import "./styles.css";
 
 const markdownFiles = import.meta.glob("../*.md", {
@@ -10,7 +11,7 @@ const markdownFiles = import.meta.glob("../*.md", {
 
 const STORAGE_KEY = "art-recite-react-v2";
 const SETTINGS_KEY = "art-recite-settings-v2";
-const PERMANENT_SAVE_URL = "/saved-content.json";
+const PERMANENT_SAVE_URL = `${import.meta.env.BASE_URL}saved-content.json`;
 
 function uid(prefix = "id") {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -143,7 +144,48 @@ async function readPermanentSave() {
   return payload;
 }
 
-function Editable({ className = "", html, onCommit, tagName: Tag = "div", ...props }) {
+async function readCloudContent() {
+  if (!supabase) return null;
+  const { data, error } = await supabase
+    .from("recitation_content")
+    .select("data")
+    .eq("id", "main")
+    .maybeSingle();
+
+  if (error) throw error;
+  const payload = data?.data;
+  if (!payload || !Array.isArray(payload.chapters) || !payload.settings) return null;
+  return payload;
+}
+
+async function saveCloudContent(payload) {
+  if (!supabase) throw new Error("Supabase is not configured");
+  const { error } = await supabase
+    .from("recitation_content")
+    .update({
+      data: payload,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", "main")
+    .select("id")
+    .single();
+
+  if (error) throw error;
+}
+
+async function checkEditorPermission(email) {
+  if (!supabase || !email) return false;
+  const { data, error } = await supabase
+    .from("allowed_editors")
+    .select("email")
+    .eq("email", email)
+    .maybeSingle();
+
+  if (error) return false;
+  return Boolean(data);
+}
+
+function Editable({ className = "", html, onCommit, readOnly = false, tagName: Tag = "div", ...props }) {
   const ref = useRef(null);
   const lastHtml = useRef(html);
 
@@ -158,10 +200,11 @@ function Editable({ className = "", html, onCommit, tagName: Tag = "div", ...pro
     <Tag
       ref={ref}
       className={className}
-      contentEditable
+      contentEditable={!readOnly}
       suppressContentEditableWarning
       dangerouslySetInnerHTML={{ __html: html }}
       onBlur={() => {
+        if (readOnly) return;
         const next = ref.current?.innerHTML ?? "";
         lastHtml.current = next;
         onCommit(next);
@@ -225,23 +268,107 @@ function App() {
   const [draggedChapterId, setDraggedChapterId] = useState(null);
   const [pendingScrollId, setPendingScrollId] = useState(null);
   const [isSavingPermanent, setIsSavingPermanent] = useState(false);
+  const [isSavingCloud, setIsSavingCloud] = useState(false);
+  const [session, setSession] = useState(null);
+  const [isAllowedEditor, setIsAllowedEditor] = useState(!isSupabaseConfigured);
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [isAuthBusy, setIsAuthBusy] = useState(false);
+  const [cloudStatus, setCloudStatus] = useState(isSupabaseConfigured ? "正在检查云端配置" : "本地编辑模式");
   const fileInputRef = useRef(null);
   const answerSelectionRef = useRef(null);
 
+  const userEmail = session?.user?.email ?? "";
+  const canEdit = isSupabaseConfigured ? isAllowedEditor : true;
+
   useEffect(() => {
     let cancelled = false;
-    readPermanentSave()
-      .then((payload) => {
-        if (cancelled || !payload) return;
-        setChapters(payload.chapters);
-        setSettings((current) => ({ ...current, ...payload.settings }));
-        setActiveChapterId(null);
-      })
-      .catch(() => {});
+
+    async function loadInitialContent() {
+      try {
+        if (isSupabaseConfigured) {
+          const cloudPayload = await readCloudContent();
+          if (!cancelled && cloudPayload) {
+            setChapters(cloudPayload.chapters);
+            setSettings((current) => ({ ...current, ...cloudPayload.settings }));
+            setActiveChapterId(null);
+            setCloudStatus("已读取云端内容");
+            return;
+          }
+        }
+
+        const permanentPayload = await readPermanentSave();
+        if (!cancelled && permanentPayload) {
+          setChapters(permanentPayload.chapters);
+          setSettings((current) => ({ ...current, ...permanentPayload.settings }));
+          setActiveChapterId(null);
+          setCloudStatus(isSupabaseConfigured ? "云端暂无内容，已读取内置内容" : "已读取内置内容");
+        }
+      } catch {
+        if (!cancelled) setCloudStatus("云端读取失败，已使用本地内容");
+      }
+    }
+
+    loadInitialContent();
     return () => {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    if (!supabase) return undefined;
+    let cancelled = false;
+
+    supabase.auth.getSession()
+      .then(({ data }) => {
+        if (!cancelled) setSession(data.session ?? null);
+      })
+      .catch(() => {});
+
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, nextSession) => {
+      setSession(nextSession);
+    });
+
+    return () => {
+      cancelled = true;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!isSupabaseConfigured) {
+      setIsAllowedEditor(true);
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    if (!userEmail) {
+      setIsAllowedEditor(false);
+      setCloudStatus("未登录：只读模式");
+      return () => {
+        cancelled = true;
+      };
+    }
+
+    checkEditorPermission(userEmail)
+      .then((allowed) => {
+        if (cancelled) return;
+        setIsAllowedEditor(allowed);
+        setCloudStatus(allowed ? `已登录：${userEmail} 可编辑` : `已登录：${userEmail} 只读`);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setIsAllowedEditor(false);
+          setCloudStatus("权限检查失败：只读模式");
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [userEmail]);
 
   useEffect(() => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(chapters));
@@ -352,6 +479,10 @@ function App() {
   };
 
   const addChapter = () => {
+    if (!canEdit) {
+      setNotice("只读模式：请用授权邮箱登录后再修改");
+      return;
+    }
     const chapter = {
       id: uid("chapter"),
       title: "新章节",
@@ -364,6 +495,10 @@ function App() {
   };
 
   const addSection = (chapterId) => {
+    if (!canEdit) {
+      setNotice("只读模式：请用授权邮箱登录后再修改");
+      return;
+    }
     updateChapter(chapterId, (chapter) => ({
       ...chapter,
       sections: [...chapter.sections, { id: uid("section"), title: "新小节", items: [] }],
@@ -372,6 +507,10 @@ function App() {
   };
 
   const addItem = (chapterId, sectionId) => {
+    if (!canEdit) {
+      setNotice("只读模式：请用授权邮箱登录后再修改");
+      return;
+    }
     const item = {
       id: uid("item"),
       question: "新题目",
@@ -384,12 +523,14 @@ function App() {
   };
 
   const removeItem = (chapterId, sectionId, itemId) => {
+    if (!canEdit) return;
     if (!window.confirm("确定删除这个背诵条目吗？")) return;
     updateSection(chapterId, sectionId, (section) => ({ ...section, items: section.items.filter((item) => item.id !== itemId) }));
     setNotice("已删除条目");
   };
 
   const removeSection = (chapterId, sectionId) => {
+    if (!canEdit) return;
     if (!window.confirm("确定删除这个小节及其中的条目吗？")) return;
     updateChapter(chapterId, (chapter) => ({
       ...chapter,
@@ -399,6 +540,7 @@ function App() {
   };
 
   const removeChapter = (chapterId) => {
+    if (!canEdit) return;
     if (!window.confirm("确定删除整个章节及其中的内容吗？")) return;
     setChapters((current) => current.filter((chapter) => chapter.id !== chapterId));
     if (activeChapterId === chapterId) setActiveChapterId(null);
@@ -406,6 +548,7 @@ function App() {
   };
 
   const moveChapter = (chapterId, direction) => {
+    if (!canEdit) return;
     setChapters((current) => {
       const fromIndex = current.findIndex((chapter) => chapter.id === chapterId);
       const toIndex = fromIndex + direction;
@@ -419,6 +562,7 @@ function App() {
   };
 
   const reorderChapter = (fromId, toId) => {
+    if (!canEdit) return;
     if (!fromId || !toId || fromId === toId) return;
     setChapters((current) => {
       const fromIndex = current.findIndex((chapter) => chapter.id === fromId);
@@ -521,6 +665,72 @@ function App() {
     }
   };
 
+  const saveToCloud = async () => {
+    if (!isSupabaseConfigured) {
+      setNotice("未配置 Supabase，无法云端保存");
+      return;
+    }
+    if (!canEdit) {
+      setNotice("只读模式：请用授权邮箱登录后再云端保存");
+      return;
+    }
+
+    const payload = {
+      version: 2,
+      savedAt: new Date().toISOString(),
+      settings,
+      chapters,
+    };
+
+    setIsSavingCloud(true);
+    try {
+      await saveCloudContent(payload);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(chapters));
+      localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+      setCloudStatus(`云端已保存：${new Date().toLocaleString()}`);
+      setNotice("已云端保存");
+    } catch (error) {
+      setNotice(`云端保存失败：${error.message}`);
+    } finally {
+      setIsSavingCloud(false);
+    }
+  };
+
+  const signIn = async (event) => {
+    event.preventDefault();
+    if (!supabase) {
+      setNotice("未配置 Supabase");
+      return;
+    }
+    setIsAuthBusy(true);
+    try {
+      const { error } = await supabase.auth.signInWithPassword({
+        email: authEmail.trim(),
+        password: authPassword,
+      });
+      if (error) throw error;
+      setAuthPassword("");
+      setNotice("登录成功，正在检查编辑权限");
+    } catch (error) {
+      setNotice(`登录失败：${error.message}`);
+    } finally {
+      setIsAuthBusy(false);
+    }
+  };
+
+  const signOut = async () => {
+    if (!supabase) return;
+    setIsAuthBusy(true);
+    try {
+      await supabase.auth.signOut();
+      setSession(null);
+      setIsAllowedEditor(false);
+      setNotice("已退出登录");
+    } finally {
+      setIsAuthBusy(false);
+    }
+  };
+
   const importBackup = (event) => {
     const file = event.target.files?.[0];
     if (!file) return;
@@ -590,20 +800,37 @@ function App() {
           <span className="sr-only">章节导航</span>
         </button>
         <div className="brand">
-          <Editable className="kicker" html={settings.kicker} onCommit={(html) => setSettings((current) => ({ ...current, kicker: html }))} />
-          <Editable className="page-title" tagName="h1" html={settings.title} onCommit={(html) => setSettings((current) => ({ ...current, title: html }))} />
+          <Editable className="kicker" html={settings.kicker} readOnly={!canEdit} onCommit={(html) => setSettings((current) => ({ ...current, kicker: html }))} />
+          <Editable className="page-title" tagName="h1" html={settings.title} readOnly={!canEdit} onCommit={(html) => setSettings((current) => ({ ...current, title: html }))} />
         </div>
         <div className="top-actions">
+          {isSupabaseConfigured && (
+            <form className="auth-panel" onSubmit={signIn}>
+              {userEmail ? (
+                <>
+                  <span className={`auth-badge ${canEdit ? "editor" : "readonly"}`}>{canEdit ? "可编辑" : "只读"}：{userEmail}</span>
+                  <button className="action-button" type="button" onClick={signOut} disabled={isAuthBusy}>退出</button>
+                </>
+              ) : (
+                <>
+                  <input className="auth-input" type="email" value={authEmail} onChange={(event) => setAuthEmail(event.target.value)} placeholder="授权邮箱" autoComplete="email" />
+                  <input className="auth-input" type="password" value={authPassword} onChange={(event) => setAuthPassword(event.target.value)} placeholder="密码" autoComplete="current-password" />
+                  <button className="action-button primary" type="submit" disabled={isAuthBusy}>{isAuthBusy ? "登录中" : "登录"}</button>
+                </>
+              )}
+            </form>
+          )}
           <button className={`action-button ${settings.reciteMode ? "selected" : "primary"}`} onClick={() => setSettings((current) => ({ ...current, reciteMode: !current.reciteMode }))}>
             <Icon>◉</Icon>背诵模式
           </button>
           <button className="action-button" onClick={toggleAllAnswers}><Icon>▣</Icon>遮挡答案</button>
           <button className="action-button" onMouseDown={(event) => event.preventDefault()} onClick={maskSelection}><Icon>✦</Icon>遮挡选中</button>
           <button className="action-button" onClick={revealAll}><Icon>○</Icon>全部显示</button>
-          <button className="action-button" onClick={savePermanent} disabled={isSavingPermanent}><Icon>✓</Icon>{isSavingPermanent ? "保存中" : "保存到网页文件"}</button>
+          {isSupabaseConfigured && <button className="action-button" onClick={saveToCloud} disabled={!canEdit || isSavingCloud}><Icon>☁</Icon>{isSavingCloud ? "云端保存中" : "云端保存"}</button>}
+          {!isSupabaseConfigured && <button className="action-button" onClick={savePermanent} disabled={isSavingPermanent}><Icon>✓</Icon>{isSavingPermanent ? "保存中" : "保存到网页文件"}</button>}
           <button className="action-button" onClick={exportBackup}><Icon>↓</Icon>导出备份</button>
-          <button className="action-button" onClick={() => fileInputRef.current?.click()}><Icon>↑</Icon>导入备份</button>
-          <button className="action-button subtle" onClick={resetContent}>重置</button>
+          <button className="action-button" onClick={() => fileInputRef.current?.click()} disabled={!canEdit}><Icon>↑</Icon>导入备份</button>
+          <button className="action-button subtle" onClick={resetContent} disabled={!canEdit}>重置</button>
           <input ref={fileInputRef} type="file" accept="application/json" onChange={importBackup} hidden />
         </div>
       </header>
@@ -611,11 +838,11 @@ function App() {
       <div className="workspace">
         <aside className="sidebar">
           <div className="sidebar-heading">
-            <Editable className="sidebar-title" html={settings.navTitle} onCommit={(html) => setSettings((current) => ({ ...current, navTitle: html }))} />
+            <Editable className="sidebar-title" html={settings.navTitle} readOnly={!canEdit} onCommit={(html) => setSettings((current) => ({ ...current, navTitle: html }))} />
             <button className="icon-button small" onClick={() => setSettings((current) => ({ ...current, sidebarOpen: false }))} title="隐藏目录"><Icon>×</Icon></button>
           </div>
           <div className="sidebar-actions">
-            <button className="small-button" onClick={addChapter}><Icon>＋</Icon>新增章节</button>
+            <button className="small-button" onClick={addChapter} disabled={!canEdit}><Icon>＋</Icon>新增章节</button>
           </div>
           <nav className="chapter-nav">
             <button className={`nav-home ${!activeChapterId ? "active" : ""}`} onClick={openHome}>
@@ -625,7 +852,7 @@ function App() {
               <div
                 className={`nav-chapter ${activeChapterId === chapter.id ? "active" : ""} ${draggedChapterId === chapter.id ? "dragging" : ""}`}
                 key={chapter.id}
-                draggable
+                draggable={canEdit}
                 onDragStart={() => setDraggedChapterId(chapter.id)}
                 onDragOver={(event) => event.preventDefault()}
                 onDrop={() => reorderChapter(draggedChapterId, chapter.id)}
@@ -640,8 +867,8 @@ function App() {
                     </button>
                   </summary>
                   <div className="chapter-order-tools">
-                    <button className="mini-button" disabled={chapterIndex === 0} onClick={() => moveChapter(chapter.id, -1)}>上移</button>
-                    <button className="mini-button" disabled={chapterIndex === chapters.length - 1} onClick={() => moveChapter(chapter.id, 1)}>下移</button>
+                    <button className="mini-button" disabled={!canEdit || chapterIndex === 0} onClick={() => moveChapter(chapter.id, -1)}>上移</button>
+                    <button className="mini-button" disabled={!canEdit || chapterIndex === chapters.length - 1} onClick={() => moveChapter(chapter.id, 1)}>下移</button>
                   </div>
                   <div className="nav-sections">
                     {chapter.sections.map((section) => (
@@ -665,6 +892,7 @@ function App() {
             <div className="stats"><strong>{chapters.length}</strong> 章节 · <strong>{sectionCount}</strong> 小节 · <strong>{itemCount}</strong> 条目 · 已遮挡 <strong>{maskedCount}</strong> 项</div>
             <label className="search-box"><Icon>⌕</Icon><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索题目或答案" /></label>
           </div>
+          <div className={`cloud-status ${canEdit ? "editable" : "readonly"}`}>{cloudStatus}</div>
 
           {!activeChapterId && (
             <section className="home-panel">
@@ -687,20 +915,20 @@ function App() {
           {visibleChapters.map((chapter) => (
             <section className="chapter" id={chapter.id} key={chapter.id}>
               <div className="chapter-heading">
-                <Editable className="chapter-title" tagName="h2" html={chapter.title} onCommit={(html) => updateChapter(chapter.id, (current) => ({ ...current, title: html }))} />
+                <Editable className="chapter-title" tagName="h2" html={chapter.title} readOnly={!canEdit} onCommit={(html) => updateChapter(chapter.id, (current) => ({ ...current, title: html }))} />
                 <div className="chapter-tools">
-                  <button className="small-button" onClick={() => addSection(chapter.id)}><Icon>＋</Icon>新增小节</button>
-                  <button className="icon-button small danger" onClick={() => removeChapter(chapter.id)} title="删除章节"><Icon>⌫</Icon></button>
+                  <button className="small-button" onClick={() => addSection(chapter.id)} disabled={!canEdit}><Icon>＋</Icon>新增小节</button>
+                  <button className="icon-button small danger" onClick={() => removeChapter(chapter.id)} disabled={!canEdit} title="删除章节"><Icon>⌫</Icon></button>
                 </div>
               </div>
 
               {chapter.sections.map((section) => (
                 <section className="content-section" id={section.id} key={section.id}>
                   <div className="section-heading">
-                    <Editable className="section-title" tagName="h3" html={section.title} onCommit={(html) => updateSection(chapter.id, section.id, (current) => ({ ...current, title: html }))} />
+                    <Editable className="section-title" tagName="h3" html={section.title} readOnly={!canEdit} onCommit={(html) => updateSection(chapter.id, section.id, (current) => ({ ...current, title: html }))} />
                     <div className="section-tools">
-                      <button className="small-button" onClick={() => addItem(chapter.id, section.id)}><Icon>＋</Icon>新增题目</button>
-                      <button className="icon-button small danger" onClick={() => removeSection(chapter.id, section.id)} title="删除小节"><Icon>⌫</Icon></button>
+                      <button className="small-button" onClick={() => addItem(chapter.id, section.id)} disabled={!canEdit}><Icon>＋</Icon>新增题目</button>
+                      <button className="icon-button small danger" onClick={() => removeSection(chapter.id, section.id)} disabled={!canEdit} title="删除小节"><Icon>⌫</Icon></button>
                     </div>
                   </div>
                   <div className="items">
@@ -714,7 +942,7 @@ function App() {
                         data-chapter-id={chapter.id}
                       >
                         <div className="item-header">
-                          <Editable className="item-question" tagName="h4" html={item.question} onCommit={(html) => updateItem(chapter.id, section.id, item.id, (current) => ({ ...current, question: html }))} />
+                          <Editable className="item-question" tagName="h4" html={item.question} readOnly={!canEdit} onCommit={(html) => updateItem(chapter.id, section.id, item.id, (current) => ({ ...current, question: html }))} />
                           <div className="item-actions">
                             {settings.reciteMode && (
                               <>
@@ -722,12 +950,13 @@ function App() {
                                 <button className="small-button" onClick={() => updateItem(chapter.id, section.id, item.id, (current) => ({ ...current, maskedAnswer: !current.maskedAnswer }))}>{item.maskedAnswer ? "显示答案" : "遮挡答案"}</button>
                               </>
                             )}
-                            <button className="icon-button small danger" onClick={() => removeItem(chapter.id, section.id, item.id)} title="删除条目"><Icon>⌫</Icon></button>
+                            <button className="icon-button small danger" onClick={() => removeItem(chapter.id, section.id, item.id)} disabled={!canEdit} title="删除条目"><Icon>⌫</Icon></button>
                           </div>
                         </div>
                         <Editable
                           className="item-answer"
                           html={item.answerHtml}
+                          readOnly={!canEdit}
                           onClick={(event) => {
                             const target = event.target.closest?.(".masked-text");
                             if (!target) return;
