@@ -214,6 +214,55 @@ function Editable({ className = "", html, onCommit, readOnly = false, tagName: T
   );
 }
 
+function EditableText({ className = "", value, placeholder, onCommit, readOnly = false, tagName: Tag = "div", ...props }) {
+  const ref = useRef(null);
+  const lastValue = useRef(value ?? "");
+
+  useEffect(() => {
+    if (!ref.current || document.activeElement === ref.current) return;
+    if (lastValue.current !== value) {
+      ref.current.textContent = value ?? "";
+      lastValue.current = value ?? "";
+    }
+  }, [value]);
+
+  return (
+    <Tag
+      ref={ref}
+      className={className}
+      contentEditable={!readOnly}
+      suppressContentEditableWarning
+      data-placeholder={placeholder}
+      onBlur={() => {
+        if (readOnly) return;
+        const next = ref.current?.textContent?.trim() ?? "";
+        lastValue.current = next;
+        onCommit(next);
+      }}
+      {...props}
+    >
+      {value}
+    </Tag>
+  );
+}
+
+function EditableAnswer({ className = "", html, placeholder, onCommit, readOnly = false, ...props }) {
+  const isEmpty = !html || html === "<p><br></p>" || html === "<p></p>";
+  return (
+    <Editable
+      className={`${className} ${isEmpty ? "is-empty" : ""}`}
+      html={html}
+      readOnly={readOnly}
+      data-placeholder={placeholder}
+      onCommit={(nextHtml) => {
+        const plain = nextHtml.replace(/<[^>]*>/g, "").replace(/&nbsp;/g, "").trim();
+        onCommit(plain ? nextHtml : "");
+      }}
+      {...props}
+    />
+  );
+}
+
 function Icon({ children }) {
   return <span className="button-icon" aria-hidden="true">{children}</span>;
 }
@@ -275,11 +324,52 @@ function App() {
   const [authPassword, setAuthPassword] = useState("");
   const [isAuthBusy, setIsAuthBusy] = useState(false);
   const [cloudStatus, setCloudStatus] = useState(isSupabaseConfigured ? "正在检查云端配置" : "本地编辑模式");
+  const [undoStack, setUndoStack] = useState([]);
+  const [collapsedNavChapters, setCollapsedNavChapters] = useState(() => new Set());
   const fileInputRef = useRef(null);
   const answerSelectionRef = useRef(null);
+  const lastSnapshotRef = useRef(null);
 
   const userEmail = session?.user?.email ?? "";
   const canEdit = isSupabaseConfigured ? isAllowedEditor : true;
+
+  const makeSnapshot = (nextChapters = chapters, nextSettings = settings) => ({
+    chapters: JSON.parse(JSON.stringify(nextChapters)),
+    settings: JSON.parse(JSON.stringify(nextSettings)),
+  });
+
+  const rememberSnapshot = () => {
+    if (!canEdit) return;
+    const snapshot = makeSnapshot();
+    const serialized = JSON.stringify(snapshot);
+    if (lastSnapshotRef.current === serialized) return;
+    lastSnapshotRef.current = serialized;
+    setUndoStack((current) => [...current.slice(-19), snapshot]);
+  };
+
+  const applyChaptersChange = (changer) => {
+    rememberSnapshot();
+    setChapters((current) => typeof changer === "function" ? changer(current) : changer);
+  };
+
+  const applySettingsChange = (changer) => {
+    rememberSnapshot();
+    setSettings((current) => typeof changer === "function" ? changer(current) : changer);
+  };
+
+  const undoLastChange = () => {
+    setUndoStack((current) => {
+      const snapshot = current.at(-1);
+      if (!snapshot) {
+        setNotice("没有可撤回的修改");
+        return current;
+      }
+      setChapters(snapshot.chapters);
+      setSettings(snapshot.settings);
+      setNotice("已撤回上一步修改");
+      return current.slice(0, -1);
+    });
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -461,7 +551,7 @@ function App() {
   );
 
   const updateChapter = (chapterId, updater) => {
-    setChapters((current) => current.map((chapter) => chapter.id === chapterId ? updater(chapter) : chapter));
+    applyChaptersChange((current) => current.map((chapter) => chapter.id === chapterId ? updater(chapter) : chapter));
   };
 
   const updateSection = (chapterId, sectionId, updater) => {
@@ -478,6 +568,16 @@ function App() {
     }));
   };
 
+  const setMaskState = (chapterId, sectionId, itemId, updater) => {
+    setChapters((current) => current.map((chapter) => chapter.id !== chapterId ? chapter : ({
+      ...chapter,
+      sections: chapter.sections.map((section) => section.id !== sectionId ? section : ({
+        ...section,
+        items: section.items.map((item) => item.id === itemId ? updater(item) : item),
+      })),
+    })));
+  };
+
   const addChapter = () => {
     if (!canEdit) {
       setNotice("只读模式：请用授权邮箱登录后再修改");
@@ -485,11 +585,11 @@ function App() {
     }
     const chapter = {
       id: uid("chapter"),
-      title: "新章节",
+      title: "",
       source: "手动添加",
-      sections: [{ id: uid("section"), title: "知识点", items: [] }],
+      sections: [{ id: uid("section"), title: "", items: [] }],
     };
-    setChapters((current) => [...current, chapter]);
+    applyChaptersChange((current) => [...current, chapter]);
     setActiveChapterId(chapter.id);
     setNotice("已新增章节");
   };
@@ -501,7 +601,7 @@ function App() {
     }
     updateChapter(chapterId, (chapter) => ({
       ...chapter,
-      sections: [...chapter.sections, { id: uid("section"), title: "新小节", items: [] }],
+      sections: [...chapter.sections, { id: uid("section"), title: "", items: [] }],
     }));
     setNotice("已新增小节");
   };
@@ -513,8 +613,8 @@ function App() {
     }
     const item = {
       id: uid("item"),
-      question: "新题目",
-      answerHtml: "<p>在这里输入答案。</p>",
+      question: "",
+      answerHtml: "",
       maskedQuestion: false,
       maskedAnswer: false,
     };
@@ -542,14 +642,14 @@ function App() {
   const removeChapter = (chapterId) => {
     if (!canEdit) return;
     if (!window.confirm("确定删除整个章节及其中的内容吗？")) return;
-    setChapters((current) => current.filter((chapter) => chapter.id !== chapterId));
+    applyChaptersChange((current) => current.filter((chapter) => chapter.id !== chapterId));
     if (activeChapterId === chapterId) setActiveChapterId(null);
     setNotice("已删除章节");
   };
 
   const moveChapter = (chapterId, direction) => {
     if (!canEdit) return;
-    setChapters((current) => {
+    applyChaptersChange((current) => {
       const fromIndex = current.findIndex((chapter) => chapter.id === chapterId);
       const toIndex = fromIndex + direction;
       if (fromIndex < 0 || toIndex < 0 || toIndex >= current.length) return current;
@@ -564,7 +664,7 @@ function App() {
   const reorderChapter = (fromId, toId) => {
     if (!canEdit) return;
     if (!fromId || !toId || fromId === toId) return;
-    setChapters((current) => {
+    applyChaptersChange((current) => {
       const fromIndex = current.findIndex((chapter) => chapter.id === fromId);
       const toIndex = current.findIndex((chapter) => chapter.id === toId);
       if (fromIndex < 0 || toIndex < 0) return current;
@@ -587,6 +687,15 @@ function App() {
     setActiveChapterId(chapterId);
     setPendingScrollId(scrollId ?? chapterId);
     setSettings((current) => ({ ...current, sidebarOpen: false }));
+  };
+
+  const toggleNavChapter = (chapterId) => {
+    setCollapsedNavChapters((current) => {
+      const next = new Set(current);
+      if (next.has(chapterId)) next.delete(chapterId);
+      else next.add(chapterId);
+      return next;
+    });
   };
 
   const toggleAllAnswers = () => {
@@ -615,6 +724,7 @@ function App() {
 
   const resetContent = () => {
     if (!window.confirm("恢复原始 Markdown 内容？本地编辑、手动添加和遮挡状态都会清除。")) return;
+    rememberSnapshot();
     setChapters(getInitialContent());
     setActiveChapterId(null);
     setSettings((current) => ({ ...current, title: "艺术学概论背诵" }));
@@ -800,8 +910,8 @@ function App() {
           <span className="sr-only">章节导航</span>
         </button>
         <div className="brand">
-          <Editable className="kicker" html={settings.kicker} readOnly={!canEdit} onCommit={(html) => setSettings((current) => ({ ...current, kicker: html }))} />
-          <Editable className="page-title" tagName="h1" html={settings.title} readOnly={!canEdit} onCommit={(html) => setSettings((current) => ({ ...current, title: html }))} />
+          <Editable className="kicker" html={settings.kicker} readOnly={!canEdit} onCommit={(html) => applySettingsChange((current) => ({ ...current, kicker: html }))} />
+          <Editable className="page-title" tagName="h1" html={settings.title} readOnly={!canEdit} onCommit={(html) => applySettingsChange((current) => ({ ...current, title: html }))} />
         </div>
         <div className="top-actions">
           {isSupabaseConfigured && (
@@ -826,6 +936,7 @@ function App() {
           <button className="action-button" onClick={toggleAllAnswers}><Icon>▣</Icon>遮挡答案</button>
           <button className="action-button" onMouseDown={(event) => event.preventDefault()} onClick={maskSelection}><Icon>✦</Icon>遮挡选中</button>
           <button className="action-button" onClick={revealAll}><Icon>○</Icon>全部显示</button>
+          <button className="action-button" onClick={undoLastChange} disabled={!canEdit || undoStack.length === 0}><Icon>?</Icon>??</button>
           {isSupabaseConfigured && <button className="action-button" onClick={saveToCloud} disabled={!canEdit || isSavingCloud}><Icon>☁</Icon>{isSavingCloud ? "云端保存中" : "云端保存"}</button>}
           {!isSupabaseConfigured && <button className="action-button" onClick={savePermanent} disabled={isSavingPermanent}><Icon>✓</Icon>{isSavingPermanent ? "保存中" : "保存到网页文件"}</button>}
           <button className="action-button" onClick={exportBackup}><Icon>↓</Icon>导出备份</button>
@@ -838,7 +949,7 @@ function App() {
       <div className="workspace">
         <aside className="sidebar">
           <div className="sidebar-heading">
-            <Editable className="sidebar-title" html={settings.navTitle} readOnly={!canEdit} onCommit={(html) => setSettings((current) => ({ ...current, navTitle: html }))} />
+            <Editable className="sidebar-title" html={settings.navTitle} readOnly={!canEdit} onCommit={(html) => applySettingsChange((current) => ({ ...current, navTitle: html }))} />
             <button className="icon-button small" onClick={() => setSettings((current) => ({ ...current, sidebarOpen: false }))} title="隐藏目录"><Icon>×</Icon></button>
           </div>
           <div className="sidebar-actions">
@@ -848,42 +959,57 @@ function App() {
             <button className={`nav-home ${!activeChapterId ? "active" : ""}`} onClick={openHome}>
               <Icon>⌂</Icon>首页
             </button>
-            {chapters.map((chapter, chapterIndex) => (
-              <div
-                className={`nav-chapter ${activeChapterId === chapter.id ? "active" : ""} ${draggedChapterId === chapter.id ? "dragging" : ""}`}
-                key={chapter.id}
-                draggable={canEdit}
-                onDragStart={() => setDraggedChapterId(chapter.id)}
-                onDragOver={(event) => event.preventDefault()}
-                onDrop={() => reorderChapter(draggedChapterId, chapter.id)}
-                onDragEnd={() => setDraggedChapterId(null)}
-              >
-                <details open={activeChapterId === chapter.id || !activeChapterId}>
-                  <summary>
-                    <button className="chapter-switch" onClick={(event) => { event.preventDefault(); openChapter(chapter.id); }}>
+            {chapters.map((chapter, chapterIndex) => {
+              const navCollapsed = collapsedNavChapters.has(chapter.id);
+              return (
+                <div
+                  className={`nav-chapter ${activeChapterId === chapter.id ? "active" : ""} ${draggedChapterId === chapter.id ? "dragging" : ""}`}
+                  key={chapter.id}
+                  draggable={canEdit}
+                  onDragStart={() => setDraggedChapterId(chapter.id)}
+                  onDragOver={(event) => event.preventDefault()}
+                  onDrop={() => reorderChapter(draggedChapterId, chapter.id)}
+                  onDragEnd={() => setDraggedChapterId(null)}
+                >
+                  <div className="chapter-nav-row">
+                    <button className="chapter-switch" onClick={() => openChapter(chapter.id)}>
                       <span className="drag-handle" title="拖拽调整章节顺序">☰</span>
                       <span className="chapter-switch-title">{chapter.title || "未命名章节"}</span>
                       <span className="chapter-count">{countItems(chapter)}</span>
                     </button>
-                  </summary>
-                  <div className="chapter-order-tools">
-                    <button className="mini-button" disabled={!canEdit || chapterIndex === 0} onClick={() => moveChapter(chapter.id, -1)}>上移</button>
-                    <button className="mini-button" disabled={!canEdit || chapterIndex === chapters.length - 1} onClick={() => moveChapter(chapter.id, 1)}>下移</button>
+                    <button
+                      className="nav-toggle"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        toggleNavChapter(chapter.id);
+                      }}
+                      title={navCollapsed ? "展开小层级" : "收起小层级"}
+                    >
+                      {navCollapsed ? "▸" : "▾"}
+                    </button>
                   </div>
-                  <div className="nav-sections">
-                    {chapter.sections.map((section) => (
-                      <div className="nav-section" key={section.id}>
-                        <button className="nav-section-link" onClick={() => openChapter(chapter.id, section.id)}>{section.title || "未命名小节"}</button>
-                        <div className="nav-items">
-                          {section.items.map((item) => <button key={item.id} onClick={() => openChapter(chapter.id, item.id)}>{item.question || "未命名题目"}</button>)}
-                          {section.items.length === 0 && <em>暂无条目</em>}
-                        </div>
+                  {!navCollapsed && (
+                    <>
+                      <div className="chapter-order-tools">
+                        <button className="mini-button" disabled={!canEdit || chapterIndex === 0} onClick={() => moveChapter(chapter.id, -1)}>上移</button>
+                        <button className="mini-button" disabled={!canEdit || chapterIndex === chapters.length - 1} onClick={() => moveChapter(chapter.id, 1)}>下移</button>
                       </div>
-                    ))}
-                  </div>
-                </details>
-              </div>
-            ))}
+                      <div className="nav-sections">
+                        {chapter.sections.map((section) => (
+                          <div className="nav-section" key={section.id}>
+                            <button className="nav-section-link" onClick={() => openChapter(chapter.id, section.id)}>{section.title || "未命名小节"}</button>
+                            <div className="nav-items">
+                              {section.items.map((item) => <button key={item.id} onClick={() => openChapter(chapter.id, item.id)}>{item.question || "未命名题目"}</button>)}
+                              {section.items.length === 0 && <em>暂无条目</em>}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </>
+                  )}
+                </div>
+              );
+            })}
           </nav>
         </aside>
 
@@ -915,7 +1041,7 @@ function App() {
           {visibleChapters.map((chapter) => (
             <section className="chapter" id={chapter.id} key={chapter.id}>
               <div className="chapter-heading">
-                <Editable className="chapter-title" tagName="h2" html={chapter.title} readOnly={!canEdit} onCommit={(html) => updateChapter(chapter.id, (current) => ({ ...current, title: html }))} />
+                <EditableText className="chapter-title" tagName="h2" value={chapter.title} placeholder="输入章节名称" readOnly={!canEdit} onCommit={(value) => updateChapter(chapter.id, (current) => ({ ...current, title: value }))} />
                 <div className="chapter-tools">
                   <button className="small-button" onClick={() => addSection(chapter.id)} disabled={!canEdit}><Icon>＋</Icon>新增小节</button>
                   <button className="icon-button small danger" onClick={() => removeChapter(chapter.id)} disabled={!canEdit} title="删除章节"><Icon>⌫</Icon></button>
@@ -925,9 +1051,9 @@ function App() {
               {chapter.sections.map((section) => (
                 <section className="content-section" id={section.id} key={section.id}>
                   <div className="section-heading">
-                    <Editable className="section-title" tagName="h3" html={section.title} readOnly={!canEdit} onCommit={(html) => updateSection(chapter.id, section.id, (current) => ({ ...current, title: html }))} />
+                    <EditableText className="section-title" tagName="h3" value={section.title} placeholder="输入小节名称" readOnly={!canEdit} onCommit={(value) => updateSection(chapter.id, section.id, (current) => ({ ...current, title: value }))} />
                     <div className="section-tools">
-                      <button className="small-button" onClick={() => addItem(chapter.id, section.id)} disabled={!canEdit}><Icon>＋</Icon>新增题目</button>
+
                       <button className="icon-button small danger" onClick={() => removeSection(chapter.id, section.id)} disabled={!canEdit} title="删除小节"><Icon>⌫</Icon></button>
                     </div>
                   </div>
@@ -942,7 +1068,7 @@ function App() {
                         data-chapter-id={chapter.id}
                       >
                         <div className="item-header">
-                          <Editable className="item-question" tagName="h4" html={item.question} readOnly={!canEdit} onCommit={(html) => updateItem(chapter.id, section.id, item.id, (current) => ({ ...current, question: html }))} />
+                          <EditableText className="item-question" tagName="h4" value={item.question} placeholder="输入题目" readOnly={!canEdit} onCommit={(value) => updateItem(chapter.id, section.id, item.id, (current) => ({ ...current, question: value }))} />
                           <div className="item-actions">
                             {settings.reciteMode && (
                               <>
@@ -953,9 +1079,10 @@ function App() {
                             <button className="icon-button small danger" onClick={() => removeItem(chapter.id, section.id, item.id)} disabled={!canEdit} title="删除条目"><Icon>⌫</Icon></button>
                           </div>
                         </div>
-                        <Editable
+                        <EditableAnswer
                           className="item-answer"
                           html={item.answerHtml}
+                          placeholder="输入答案"
                           readOnly={!canEdit}
                           onClick={(event) => {
                             const target = event.target.closest?.(".masked-text");
@@ -969,7 +1096,8 @@ function App() {
                         {(item.maskedQuestion || item.maskedAnswer) && <button className="reveal-hint" onClick={() => updateItem(chapter.id, section.id, item.id, (current) => ({ ...current, maskedQuestion: false, maskedAnswer: false }))}>点击显示</button>}
                       </article>
                     ))}
-                    {section.items.length === 0 && <div className="empty-chapter">这个小节还没有内容，点击“新增题目”开始整理。</div>}
+                    {section.items.length === 0 && <div className="empty-chapter">??????????</div>}
+                    <button className="add-item-tail" onClick={() => addItem(chapter.id, section.id)} disabled={!canEdit}><Icon>＋</Icon>新增题目</button>
                   </div>
                 </section>
               ))}
