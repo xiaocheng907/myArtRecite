@@ -27,6 +27,31 @@ function escapeHtml(value = "") {
   }[char]));
 }
 
+function insertPlainTextAtCursor(text) {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0) return false;
+
+  selection.deleteFromDocument();
+  const range = selection.getRangeAt(0);
+  const textNode = document.createTextNode(text);
+  range.insertNode(textNode);
+  range.setStartAfter(textNode);
+  range.collapse(true);
+  selection.removeAllRanges();
+  selection.addRange(range);
+  return true;
+}
+
+function handlePlainTextPaste(event) {
+  const text = event.clipboardData?.getData("text/plain");
+  if (text == null) return;
+  event.preventDefault();
+
+  if (!document.execCommand?.("insertText", false, text)) {
+    insertPlainTextAtCursor(text);
+  }
+}
+
 function formatAnswer(lines) {
   const paragraphs = lines.join("\n").split(/\n{2,}/).map((part) => part.trim()).filter(Boolean);
   return paragraphs.map((part) => `<p>${escapeHtml(part).replace(/\n/g, "<br />")}</p>`).join("");
@@ -203,6 +228,7 @@ function Editable({ className = "", html, onCommit, readOnly = false, tagName: T
       contentEditable={!readOnly}
       suppressContentEditableWarning
       dangerouslySetInnerHTML={{ __html: html }}
+      onPaste={handlePlainTextPaste}
       onBlur={() => {
         if (readOnly) return;
         const next = ref.current?.innerHTML ?? "";
@@ -233,6 +259,7 @@ function EditableText({ className = "", value, placeholder, onCommit, readOnly =
       contentEditable={!readOnly}
       suppressContentEditableWarning
       data-placeholder={placeholder}
+      onPaste={handlePlainTextPaste}
       onBlur={() => {
         if (readOnly) return;
         const next = ref.current?.textContent?.trim() ?? "";
@@ -936,7 +963,7 @@ function App() {
           <button className="action-button" onClick={toggleAllAnswers}><Icon>▣</Icon>遮挡答案</button>
           <button className="action-button" onMouseDown={(event) => event.preventDefault()} onClick={maskSelection}><Icon>✦</Icon>遮挡选中</button>
           <button className="action-button" onClick={revealAll}><Icon>○</Icon>全部显示</button>
-          <button className="action-button" onClick={undoLastChange} disabled={!canEdit || undoStack.length === 0}><Icon>?</Icon>??</button>
+          <button className="action-button" onClick={undoLastChange} disabled={!canEdit || undoStack.length === 0}><Icon>↶</Icon>撤回</button>
           {isSupabaseConfigured && <button className="action-button" onClick={saveToCloud} disabled={!canEdit || isSavingCloud}><Icon>☁</Icon>{isSavingCloud ? "云端保存中" : "云端保存"}</button>}
           {!isSupabaseConfigured && <button className="action-button" onClick={savePermanent} disabled={isSavingPermanent}><Icon>✓</Icon>{isSavingPermanent ? "保存中" : "保存到网页文件"}</button>}
           <button className="action-button" onClick={exportBackup}><Icon>↓</Icon>导出备份</button>
